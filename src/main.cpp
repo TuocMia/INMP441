@@ -1,5 +1,8 @@
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
 
 #include "AudioTools.h"
 
@@ -8,27 +11,38 @@ using namespace audio_tools;
 namespace {
 constexpr const char *kWifiSsid = "TP-LINK_B9D2";
 constexpr const char *kWifiPassword = "21377570";
-constexpr const char *kRecorderHost = "192.168.0.106";
+constexpr const char *kRecorderHost = "192.168.0.102";
 constexpr uint16_t kRecorderPort = 5000;
+constexpr uint16_t kUdpLocalPort = 5001;
 
 constexpr int kPinI2sBck = 14;
 constexpr int kPinI2sWs = 15;
 constexpr int kPinI2sSd = 32;
 constexpr int kPinBoot = 0;  // BOOT button on GPIO0
 
-const AudioInfo kMicInfo(16000, 1, 32);
+const AudioInfo kMicInfo(16000, 2, 32);
+const AudioInfo kMicMonoInfo(16000, 1, 32);
 const AudioInfo kPcmInfo(16000, 1, 16);
+constexpr float kAudioGain = 0.5f;
+constexpr size_t kFrameMs = 20;
+constexpr size_t kPcmPayloadBytes = 640;  // 16kHz * 1ch * 16bit * 20ms
 
 I2SStream mic;
-WiFiClient client;
-FormatConverterStream converter(mic);
-StreamCopy copier(8192);
+WiFiUDP udp;
+ChannelFormatConverterStream channelConverter(mic);
+NumberFormatConverterStream numberConverter(channelConverter);
 
 bool audioStarted = false;
-bool isRecording = false;
+volatile bool isRecording = false;
+volatile bool wifiReady = false;
+bool udpStarted = false;
+uint32_t packetSequence = 0;
 unsigned long lastButtonPressTime = 0;
 const unsigned long buttonDebounceDelay = 50;  // 50ms debounce (rút ngắn)
 bool lastButtonState = HIGH;
+
+TaskHandle_t controlTaskHandle = nullptr;
+TaskHandle_t audioTaskHandle = nullptr;
 
 bool connectWiFi() {
   if (WiFi.status() == WL_CONNECTED) {
@@ -36,6 +50,7 @@ bool connectWiFi() {
   }
 
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
   WiFi.begin(kWifiSsid, kWifiPassword);
 
   Serial.print("Connecting WiFi");
@@ -53,6 +68,7 @@ bool connectWiFi() {
   Serial.println();
   Serial.print("WiFi connected, IP: ");
   Serial.println(WiFi.localIP());
+  WiFi.setSleep(false);
   return true;
 }
 
@@ -65,7 +81,11 @@ bool startAudioPipeline() {
   cfg.sample_rate = kMicInfo.sample_rate;
   cfg.channels = kMicInfo.channels;
   cfg.bits_per_sample = 32;  // INMP441 outputs in 32-bit I2S slots
+#if defined(I2S_CHANNEL_FMT_ONLY_LEFT)
   cfg.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;  // INMP441 L/R tied to GND -> left channel
+#elif defined(I2S_CHANNEL_FMT_ALL_LEFT)
+  cfg.channel_format = I2S_CHANNEL_FMT_ALL_LEFT;
+#endif
   cfg.i2s_format = I2S_STD_FORMAT;
   cfg.is_master = true;
   cfg.pin_bck = kPinI2sBck;
@@ -80,8 +100,13 @@ bool startAudioPipeline() {
     return false;
   }
 
-  if (!converter.begin(kMicInfo, kPcmInfo)) {
-    Serial.println("Failed to start format converter");
+  if (!channelConverter.begin(kMicInfo, kMicMonoInfo)) {
+    Serial.println("Failed to start channel converter");
+    return false;
+  }
+
+  if (!numberConverter.begin(kMicMonoInfo, kPcmInfo.bits_per_sample, kAudioGain)) {
+    Serial.println("Failed to start number converter");
     return false;
   }
 
@@ -89,24 +114,18 @@ bool startAudioPipeline() {
   return true;
 }
 
-bool connectRecorder() {
-  if (client.connected()) {
+bool startUdp() {
+  if (udpStarted) {
     return true;
   }
 
-  client.stop();
-  if (!client.connect(kRecorderHost, kRecorderPort)) {
-    Serial.print("Could not connect to recorder server ");
-    Serial.print(kRecorderHost);
-    Serial.print(":");
-    Serial.println(kRecorderPort);
+  if (!udp.begin(kUdpLocalPort)) {
+    Serial.println("Failed to start UDP");
     return false;
   }
 
-  client.setNoDelay(false);
-
-  copier.begin(client, converter);
-  Serial.println("Recorder connected");
+  udpStarted = true;
+  Serial.println("UDP transport ready");
   return true;
 }
 
@@ -122,16 +141,84 @@ void checkBootButton() {
       isRecording = !isRecording;
       
       if (isRecording) {
+        packetSequence = 0;
         Serial.println("Recording STARTED");
       } else {
         Serial.println("Recording STOPPED");
-        if (client.connected()) {
-          client.stop();
-        }
       }
     }
   }
   lastButtonState = currentButtonState;
+}
+
+void controlTask(void *parameter) {
+  (void)parameter;
+  unsigned long lastWifiAttemptTime = 0;
+
+  for (;;) {
+    checkBootButton();
+
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiReady = true;
+    } else {
+      wifiReady = false;
+      unsigned long now = millis();
+      if (now - lastWifiAttemptTime >= 1000) {
+        lastWifiAttemptTime = now;
+        connectWiFi();
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+void audioTask(void *parameter) {
+  (void)parameter;
+  static uint8_t pcmBuffer[kPcmPayloadBytes];
+  static uint8_t packetBuffer[4 + kPcmPayloadBytes];
+
+  for (;;) {
+    if (!audioStarted && !startAudioPipeline()) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+
+    if (!udpStarted && !startUdp()) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+
+    if (!isRecording) {
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+
+    if (!wifiReady) {
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+
+    size_t pcmRead = numberConverter.readBytes(pcmBuffer, sizeof(pcmBuffer));
+    if (pcmRead == 0) {
+      vTaskDelay(pdMS_TO_TICKS(1));
+      continue;
+    }
+
+    packetBuffer[0] = static_cast<uint8_t>(packetSequence & 0xFF);
+    packetBuffer[1] = static_cast<uint8_t>((packetSequence >> 8) & 0xFF);
+    packetBuffer[2] = static_cast<uint8_t>((packetSequence >> 16) & 0xFF);
+    packetBuffer[3] = static_cast<uint8_t>((packetSequence >> 24) & 0xFF);
+    memcpy(packetBuffer + 4, pcmBuffer, pcmRead);
+
+    if (udp.beginPacket(kRecorderHost, kRecorderPort)) {
+      udp.write(packetBuffer, 4 + pcmRead);
+      udp.endPacket();
+      ++packetSequence;
+    }
+
+    taskYIELD();
+  }
 }
 
 }  // namespace
@@ -140,43 +227,26 @@ void setup() {
   Serial.begin(115200);
   AudioToolsLogger.begin(Serial, AudioToolsLogLevel::Warning);
   
-  pinMode(kPinBoot, INPUT);  // Initialize BOOT button pin
+  pinMode(kPinBoot, INPUT_PULLUP);  // BOOT button is active LOW
 
   if (!connectWiFi()) {
-    return;
+    Serial.println("WiFi not ready at boot, retrying in control task");
+  } else {
+    wifiReady = true;
   }
 
   if (!startAudioPipeline()) {
-    return;
+    Serial.println("Audio pipeline not ready at boot, retrying in audio task");
   }
 
   Serial.println("Press BOOT button to start/stop recording");
+
+  xTaskCreatePinnedToCore(controlTask, "control-task", 4096, nullptr, 2,
+                          &controlTaskHandle, 1);
+  xTaskCreatePinnedToCore(audioTask, "audio-task", 8192, nullptr, 3,
+                          &audioTaskHandle, 0);
 }
 
 void loop() {
-  checkBootButton();  // Check if BOOT button is pressed
-  
-  if (!connectWiFi()) {
-    delay(100);
-    return;
-  }
-
-  if (!audioStarted && !startAudioPipeline()) {
-    delay(100);
-    return;
-  }
-
-  if (isRecording) {
-    if (!client.connected()) {
-      if (!connectRecorder()) {
-        delay(100);
-        return;
-      }
-    }
-    copier.copy();
-  } else {
-    if (client.connected()) {
-      client.stop();
-    }
-  }
+  vTaskDelay(pdMS_TO_TICKS(1000));
 }
