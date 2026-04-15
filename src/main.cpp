@@ -9,9 +9,9 @@
 using namespace audio_tools;
 
 namespace {
-constexpr const char *kWifiSsid = "TP-LINK_B9D2";
-constexpr const char *kWifiPassword = "21377570";
-constexpr const char *kRecorderHost = "192.168.0.102";
+constexpr const char *kWifiSsid = "ssid wifi";
+constexpr const char *kWifiPassword = "password wifi";
+constexpr const char *kRecorderHost = "host ip address";
 constexpr uint16_t kRecorderPort = 5000;
 constexpr uint16_t kUdpLocalPort = 5001;
 
